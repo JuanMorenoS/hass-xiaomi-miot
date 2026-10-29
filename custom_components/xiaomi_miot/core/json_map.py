@@ -99,6 +99,16 @@ def room_names(map_data):
     return names
 
 
+def room_ids(map_data):
+    """Ids of the rooms in this map, sorted."""
+    ids = set()
+    for room in map_data.get('map_room_info') or []:
+        rid = room.get('room_id')
+        if rid is not None:
+            ids.add(int(rid))
+    return sorted(ids)
+
+
 def map_label(map_data):
     """A stable name for the map, used as the camera state."""
     name = (map_data.get('map_name') or '').strip()
