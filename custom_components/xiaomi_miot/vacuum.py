@@ -4,12 +4,14 @@ import logging
 import asyncio
 from datetime import timedelta
 
+from homeassistant.components.camera import Camera
 from homeassistant.components.vacuum import (  # noqa: F401
     DOMAIN as ENTITY_DOMAIN,
     StateVacuumEntity,
     VacuumActivity,
     VacuumEntityFeature,  # v2022.5
 )
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 try:
     from homeassistant.components.vacuum import Segment  # v2026.3
@@ -22,11 +24,14 @@ from . import (
     XIAOMI_CONFIG_SCHEMA as PLATFORM_SCHEMA,  # noqa: F401
     HassEntry,
     MiotEntity,
+    MiotCloud,
+    BaseSubEntity,
     MIOT_LOCAL_MODELS,
     async_setup_config_entry,
     bind_services_to_entries,
 )
 from .core.utils import DeviceException
+from .core import json_map
 from .core.miot_spec import (
     MiotSpec,
     MiotService,
@@ -131,12 +136,25 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
         if clean_area and Segment and self._prop_room_info and self._act_room_sweep:
             self._supported_features |= clean_area
 
+        # Cloud JSON map (xiaomi.vacuum.* models with a vacuum-map service)
+        self._prop_map_obj = None
+        if str(self.model).startswith('xiaomi.vacuum.'):
+            if srv := miot_service.spec.get_service('vacuum_map'):
+                self._prop_map_obj = srv.get_property('map_obj_name')
+        self._map_key = None
+        self._map_object = None
+        self._map_image = None
+        self._map_rooms = {}
+        self._map_attrs = {}
+
     async def async_update(self):
         await super().async_update()
         if not self._available:
             return
         if self._prop_room_info and self._act_room_sweep:
             self._update_room_info()
+        if self._prop_map_obj:
+            await self._async_update_map()
         if self._prop_status:
             self._prop_status.description_to_dict(self._state_attrs)
             val = self._prop_status.from_device(self.device)
@@ -232,8 +250,80 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
             if not isinstance(r, dict) or r.get('id') is None:
                 continue
             rid = str(r['id'])
-            segments.append(Segment(id=rid, name=r.get('name') or f'Room {rid}'))
+            name = r.get('name') or (self._map_rooms.get(int(rid)) if rid.isdigit() else None)
+            segments.append(Segment(id=rid, name=name or f'Room {rid}'))
         return segments
+
+    @property
+    def map_image(self):
+        return self._map_image
+
+    @property
+    def map_attributes(self):
+        return self._map_attrs
+
+    async def _async_update_map(self):
+        cloud = self.xiaomi_cloud
+        did = self.miot_did
+        if not isinstance(cloud, MiotCloud) or not did:
+            return
+        if add_cameras := self.device.entry.adders.get('camera'):
+            if 'map' not in self._subs:
+                self._subs['map'] = VacuumMapCameraEntity(self)
+                add_cameras([self._subs['map']], update_before_add=False)
+        try:
+            rst = await cloud.async_get_props([{
+                'did': str(did),
+                'siid': self._prop_map_obj.service.iid,
+                'piid': self._prop_map_obj.iid,
+            }]) or []
+            obj = rst[0].get('value') if rst and rst[0].get('code', 0) == 0 else None
+            if not obj or not isinstance(obj, str) or obj == self._map_object:
+                return
+            name = json_map.object_file_name(obj)
+            url = None
+            for api in ['v2/home/get_interim_file_url_pro', 'v2/home/get_interim_file_url']:
+                rdt = await cloud.async_request_api(api, {'obj_name': name}) or {}
+                url = (rdt.get('result') or {}).get('url')
+                if url:
+                    break
+            if not url:
+                self.logger.debug('%s: No map file url for %s', self.name_model, name)
+                return
+            session = async_get_clientsession(self.hass)
+            async with session.get(url, timeout=20) as resp:
+                if resp.status != 200:
+                    self.logger.debug('%s: Map download failed: %s', self.name_model, resp.status)
+                    return
+                raw = await resp.read()
+            if self._map_key is None:
+                self._map_key = json_map.derive_key(self.model, did)
+            decoded = await self.hass.async_add_executor_job(json_map.decrypt_map, raw, self._map_key)
+            if not decoded:
+                return
+            image = await self.hass.async_add_executor_job(json_map.render_map, decoded)
+            if not image:
+                return
+        except Exception as exc:  # a map failure must not break the vacuum update
+            self.logger.debug('%s: Map update failed: %s', self.name_model, exc)
+            return
+        self._map_object = obj
+        self._map_image = image
+        self._map_rooms = json_map.room_names(decoded)
+        room_id, room_name = json_map.current_room(decoded)
+        self._map_attrs = {
+            'map_name': json_map.map_label(decoded),
+            'map_id': decoded.get('map_id'),
+            'rooms': {str(k): v for k, v in self._map_rooms.items()},
+            'current_room': room_name,
+            'current_room_id': room_id,
+        }
+        self._state_attrs.update({
+            'current_room': room_name,
+            'current_room_id': room_id,
+        })
+        if sub := self._subs.get('map'):
+            sub.update_from_parent()
 
     async def async_clean_segments(self, segment_ids, **kwargs):
         if not self._act_room_sweep:
@@ -470,3 +560,29 @@ class MiotViomiVacuumEntity(MiotVacuumEntity):
     async def async_clean_point(self, point):
         await self.async_miio_command('set_uploadmap', [0])
         return await self.async_miio_command('set_pointclean', [1, *point])
+
+
+class VacuumMapCameraEntity(BaseSubEntity, Camera):
+    """The cloud map of a vacuum, rendered by its parent vacuum entity."""
+
+    def __init__(self, parent, option=None):
+        option = {
+            'name': f'{parent.device_name} Map',
+            'icon': 'mdi:map',
+            **(option or {}),
+        }
+        super().__init__(parent, 'map', option, domain='camera')
+        Camera.__init__(self)
+        self._attr_content_type = 'image/png'
+        self._available = False
+
+    @property
+    def state(self):
+        return self._parent.map_attributes.get('map_name') or super().state
+
+    def update(self, data=None):
+        self._available = self._parent.map_image is not None
+        self._state_attrs.update(self._parent.map_attributes)
+
+    async def async_camera_image(self, width=None, height=None):
+        return self._parent.map_image
