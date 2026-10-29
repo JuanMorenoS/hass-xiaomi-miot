@@ -4,7 +4,7 @@ import logging
 import asyncio
 from datetime import timedelta
 
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.vacuum import (  # noqa: F401
     DOMAIN as ENTITY_DOMAIN,
     StateVacuumEntity,
@@ -567,7 +567,7 @@ class VacuumMapCameraEntity(BaseSubEntity, Camera):
 
     def __init__(self, parent, option=None):
         option = {
-            'name': f'{parent.device_name} Map',
+            'name': 'Map',
             'icon': 'mdi:map',
             **(option or {}),
         }
@@ -575,6 +575,10 @@ class VacuumMapCameraEntity(BaseSubEntity, Camera):
         Camera.__init__(self)
         self._attr_content_type = 'image/png'
         self._available = False
+
+    @property
+    def supported_features(self):
+        return CameraEntityFeature(0)
 
     @property
     def state(self):
