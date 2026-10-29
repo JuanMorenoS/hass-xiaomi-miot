@@ -343,16 +343,44 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
     async def async_clean_segments(self, segment_ids, **kwargs):
         if not self._act_room_sweep:
             raise NotImplementedError()
-        info = self._room_info()
-        if info.get('map_uid') is not None:
-            self._map_uid = info['map_uid']
+        # The robot accepts a room sweep without (or with a stale) map_uid and
+        # then silently ignores it, and the polled room-information is often
+        # outdated, so read it fresh right before sweeping.
+        await self._async_refresh_map_uid()
+        if self._map_uid is None:
+            info = self._room_info()
+            if info.get('map_uid') is not None:
+                self._map_uid = info['map_uid']
         rooms = [int(i) if str(i).isdigit() else i for i in segment_ids]
         payload = {'rooms': rooms}
         if self._map_uid is not None:
             payload['map_uid'] = self._map_uid
-        return await self.async_call_action(
+        else:
+            self.logger.warning('%s: Room sweep without map_uid may be ignored by the robot', self.name_model)
+        result = await self.async_call_action(
             self._act_room_sweep, [json.dumps(payload, separators=(',', ':'))],
         )
+        if not result or not getattr(result, 'is_success', True):
+            self.logger.warning('%s: Room sweep %s failed: %s', self.name_model, payload, result)
+        return result
+
+    async def _async_refresh_map_uid(self):
+        cloud = self.xiaomi_cloud
+        if not isinstance(cloud, MiotCloud) or not self.miot_did:
+            return
+        try:
+            rst = await cloud.async_get_props([{
+                'did': str(self.miot_did),
+                'siid': self._prop_room_info.service.iid,
+                'piid': self._prop_room_info.iid,
+            }]) or []
+            val = rst[0].get('value') if rst and rst[0].get('code', 0) == 0 else None
+            if isinstance(val, str) and val:
+                map_uid = json.loads(val).get('map_uid')
+                if map_uid is not None:
+                    self._map_uid = map_uid
+        except Exception as exc:
+            self.logger.debug('%s: Room information read failed: %s', self.name_model, exc)
 
     @property
     def fan_speed(self):
