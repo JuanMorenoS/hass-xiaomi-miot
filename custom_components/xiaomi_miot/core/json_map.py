@@ -163,6 +163,35 @@ def current_room(map_data):
         return None, None
 
 
+def _draw_room_labels(image, map_data, grid, width, height, room_ids):
+    """Write each room's name (or id) at the centre of its cells."""
+    from PIL import ImageDraw, ImageFont
+
+    sums = {rid: [0, 0, 0] for rid in room_ids}
+    for y in range(height):
+        row = grid[y * width:(y + 1) * width]
+        for x, value in enumerate(row):
+            acc = sums.get(value)
+            if acc is not None:
+                acc[0] += x
+                acc[1] += y
+                acc[2] += 1
+    try:
+        font = ImageFont.load_default(size=22)
+    except TypeError:  # Pillow < 10.1
+        font = ImageFont.load_default()
+    names = room_names(map_data)
+    draw = ImageDraw.Draw(image)
+    for rid, (sx, sy, count) in sums.items():
+        if not count:
+            continue
+        cx = sx / count * SCALE
+        cy = (height - 1 - sy / count) * SCALE  # labels go on the flipped image
+        label = names.get(rid) or str(rid)
+        draw.text((cx, cy), label, fill=(20, 25, 35, 255), font=font, anchor='mm',
+                  stroke_width=3, stroke_fill=(255, 255, 255, 230))
+
+
 def render_map(map_data):
     """Render the map document to PNG bytes."""
     from PIL import Image, ImageDraw
@@ -208,6 +237,7 @@ def render_map(map_data):
 
         # The device grid origin is bottom-left; images are drawn top-left.
         image = image.transpose(Image.FLIP_TOP_BOTTOM)
+        _draw_room_labels(image, map_data, grid, width, height, room_ids)
         buffer = BytesIO()
         image.save(buffer, format='PNG')
         return buffer.getvalue()
