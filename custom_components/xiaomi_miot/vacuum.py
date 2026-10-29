@@ -145,16 +145,17 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
         self._map_object = None
         self._map_image = None
         self._map_rooms = {}
+        self._map_room_ids = []
         self._map_attrs = {}
 
     async def async_update(self):
         await super().async_update()
         if not self._available:
             return
-        if self._prop_room_info and self._act_room_sweep:
-            self._update_room_info()
         if self._prop_map_obj:
             await self._async_update_map()
+        if self._prop_room_info and self._act_room_sweep:
+            self._update_room_info()
         if self._prop_status:
             self._prop_status.description_to_dict(self._state_attrs)
             val = self._prop_status.from_device(self.device)
@@ -232,27 +233,39 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
         info = self._room_info()
         if info.get('map_uid') is not None:
             self._map_uid = info['map_uid']
-        rooms = info.get('rooms')
-        if not isinstance(rooms, list) or not Segment or not self.registry_entry:
+        if not Segment or not self.registry_entry:
             return
-        ids = sorted(str(r.get('id')) for r in rooms if isinstance(r, dict))
-        if ids == self._segment_ids:
+        ids = sorted(rid for rid, _ in self._room_list(info))
+        if not ids or ids == self._segment_ids:
             return
         self._segment_ids = ids
         last_seen = self.last_seen_segments
         if last_seen is not None and sorted(s.id for s in last_seen) != ids:
             self.async_create_segments_issue()
 
+    def _room_list(self, info=None):
+        """(segment id, name) for each room.
+
+        The rooms in the latest map win: room-information is not refreshed by
+        the device after rooms are split or merged in the app, while a new map
+        object is uploaded right away.
+        """
+        info = self._room_info() if info is None else info
+        info_names = {}
+        info_ids = []
+        for r in info.get('rooms') or []:
+            if isinstance(r, dict) and r.get('id') is not None:
+                info_ids.append(str(r['id']))
+                info_names[str(r['id'])] = r.get('name') or ''
+        ids = [str(i) for i in self._map_room_ids] or info_ids
+        rooms = []
+        for rid in ids:
+            name = info_names.get(rid) or (self._map_rooms.get(int(rid)) if rid.isdigit() else None)
+            rooms.append((rid, name or f'Room {rid}'))
+        return rooms
+
     async def async_get_segments(self):
-        rooms = self._room_info().get('rooms') or []
-        segments = []
-        for r in rooms:
-            if not isinstance(r, dict) or r.get('id') is None:
-                continue
-            rid = str(r['id'])
-            name = r.get('name') or (self._map_rooms.get(int(rid)) if rid.isdigit() else None)
-            segments.append(Segment(id=rid, name=name or f'Room {rid}'))
-        return segments
+        return [Segment(id=rid, name=name) for rid, name in self._room_list()]
 
     @property
     def map_image(self):
@@ -310,10 +323,12 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
         self._map_object = obj
         self._map_image = image
         self._map_rooms = json_map.room_names(decoded)
+        self._map_room_ids = json_map.room_ids(decoded)
         room_id, room_name = json_map.current_room(decoded)
         self._map_attrs = {
             'map_name': json_map.map_label(decoded),
             'map_id': decoded.get('map_id'),
+            'room_ids': self._map_room_ids,
             'rooms': {str(k): v for k, v in self._map_rooms.items()},
             'current_room': room_name,
             'current_room_id': room_id,
