@@ -1,4 +1,5 @@
 """Support for Xiaomi vacuums."""
+import json
 import logging
 import asyncio
 from datetime import timedelta
@@ -9,6 +10,11 @@ from homeassistant.components.vacuum import (  # noqa: F401
     VacuumActivity,
     VacuumEntityFeature,  # v2022.5
 )
+
+try:
+    from homeassistant.components.vacuum import Segment  # v2026.3
+except ImportError:
+    Segment = None
 
 from . import (
     DOMAIN,
@@ -115,10 +121,22 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
             self._supported_features |= VacuumEntityFeature.LOCATE
         self._supported_features |= VacuumEntityFeature.SEND_COMMAND
 
+        # Room cleaning through HA areas (vacuum.clean_area), for models exposing
+        # room-information + start-vacuum-room-sweep (e.g. xiaomi.vacuum.d109gl)
+        self._prop_room_info = miot_service.get_property('room_information')
+        self._act_room_sweep = miot_service.get_action('start_vacuum_room_sweep')
+        self._map_uid = None
+        self._segment_ids = None
+        clean_area = getattr(VacuumEntityFeature, 'CLEAN_AREA', None)
+        if clean_area and Segment and self._prop_room_info and self._act_room_sweep:
+            self._supported_features |= clean_area
+
     async def async_update(self):
         await super().async_update()
         if not self._available:
             return
+        if self._prop_room_info and self._act_room_sweep:
+            self._update_room_info()
         if self._prop_status:
             self._prop_status.description_to_dict(self._state_attrs)
             val = self._prop_status.from_device(self.device)
@@ -181,6 +199,55 @@ class MiotVacuumEntity(MiotEntity, StateVacuumEntity):
 
     def clean_spot(self, **kwargs):
         raise NotImplementedError()
+
+    def _room_info(self):
+        val = self._prop_room_info.from_device(self.device)
+        if not isinstance(val, str) or not val:
+            return {}
+        try:
+            info = json.loads(val)
+        except ValueError:
+            return {}
+        return info if isinstance(info, dict) else {}
+
+    def _update_room_info(self):
+        info = self._room_info()
+        if info.get('map_uid') is not None:
+            self._map_uid = info['map_uid']
+        rooms = info.get('rooms')
+        if not isinstance(rooms, list) or not Segment or not self.registry_entry:
+            return
+        ids = sorted(str(r.get('id')) for r in rooms if isinstance(r, dict))
+        if ids == self._segment_ids:
+            return
+        self._segment_ids = ids
+        last_seen = self.last_seen_segments
+        if last_seen is not None and sorted(s.id for s in last_seen) != ids:
+            self.async_create_segments_issue()
+
+    async def async_get_segments(self):
+        rooms = self._room_info().get('rooms') or []
+        segments = []
+        for r in rooms:
+            if not isinstance(r, dict) or r.get('id') is None:
+                continue
+            rid = str(r['id'])
+            segments.append(Segment(id=rid, name=r.get('name') or f'Room {rid}'))
+        return segments
+
+    async def async_clean_segments(self, segment_ids, **kwargs):
+        if not self._act_room_sweep:
+            raise NotImplementedError()
+        info = self._room_info()
+        if info.get('map_uid') is not None:
+            self._map_uid = info['map_uid']
+        rooms = [int(i) if str(i).isdigit() else i for i in segment_ids]
+        payload = {'rooms': rooms}
+        if self._map_uid is not None:
+            payload['map_uid'] = self._map_uid
+        return await self.async_call_action(
+            self._act_room_sweep, [json.dumps(payload, separators=(',', ':'))],
+        )
 
     @property
     def fan_speed(self):
